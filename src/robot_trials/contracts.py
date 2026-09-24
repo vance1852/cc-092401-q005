@@ -234,8 +234,11 @@ class Observation:
             number = _decimal(value, f"observation.metrics.{key}")
             if metric.kind == "binary" and number not in {Decimal(0), Decimal(1)}:
                 raise ValidationError(f"observation.metrics.{key} 必须是 0 或 1")
-            if metric.kind == "count" and number != number.to_integral_value():
-                raise ValidationError(f"observation.metrics.{key} 必须是整数")
+            if metric.kind == "count":
+                if number != number.to_integral_value():
+                    raise ValidationError(f"observation.metrics.{key} 必须是整数")
+                if number < 0:
+                    raise ValidationError(f"observation.metrics.{key} 必须大于等于零")
             parsed[key] = number
         return cls(
             source_batch=_required_text(data.get("source_batch"), "observation.source_batch"),

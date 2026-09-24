@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from robot_trials.clock import FrozenClock
-from robot_trials.errors import Conflict, Forbidden, InvalidState
+from robot_trials.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from robot_trials.jsonio import load_json
 from robot_trials.service import TrialService
 
@@ -73,6 +73,35 @@ class ServiceTests(unittest.TestCase):
             self.service.import_observations("operator", "batch-a", "key-2", self.rows[:2])
         count = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_negative_count_rolls_back_whole_batch(self) -> None:
+        rows = [dict(item) for item in self.rows]
+        rows[2] = dict(rows[2])
+        rows[2]["metrics"] = dict(rows[2]["metrics"])
+        rows[2]["metrics"]["interventions"] = -1
+        with self.assertRaisesRegex(ValidationFailed, r"observation\.metrics\.interventions 必须大于等于零"):
+            self.service.import_observations("operator", "batch-a", "key-negative", rows)
+        observations = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
+        self.assertEqual(observations, 0)
+        idempotency_keys = self.connection.execute("SELECT count(*) FROM idempotency_keys").fetchone()[0]
+        self.assertEqual(idempotency_keys, 0)
+        imports = self.connection.execute(
+            "SELECT count(*) FROM audit_events WHERE event_type='observations.imported'"
+        ).fetchone()[0]
+        self.assertEqual(imports, 0)
+
+    def test_corrected_rows_can_reuse_rejected_idempotency_key(self) -> None:
+        rows = [dict(item) for item in self.rows]
+        rows[0] = dict(rows[0])
+        rows[0]["metrics"] = dict(rows[0]["metrics"])
+        rows[0]["metrics"]["interventions"] = -1
+        with self.assertRaises(ValidationFailed):
+            self.service.import_observations("operator", "batch-a", "key-1", rows)
+        rows[0]["metrics"]["interventions"] = 0
+        imported = self.service.import_observations("operator", "batch-a", "key-1", rows)
+        self.assertEqual(imported["inserted"], 6)
+        replayed = self.service.import_observations("operator", "batch-a", "key-1", rows)
+        self.assertEqual(replayed, imported)
 
     def test_role_separation(self) -> None:
         with self.assertRaises(Forbidden):
