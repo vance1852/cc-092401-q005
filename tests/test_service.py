@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from robot_trials.clock import FrozenClock
-from robot_trials.errors import Conflict, Forbidden, InvalidState
+from robot_trials.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from robot_trials.jsonio import load_json
 from robot_trials.service import TrialService
 
@@ -73,6 +73,48 @@ class ServiceTests(unittest.TestCase):
             self.service.import_observations("operator", "batch-a", "key-2", self.rows[:2])
         count = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_import_rolls_back_when_any_row_has_negative_count(self) -> None:
+        bad_rows = [dict(item) for item in self.rows]
+        bad_rows[3] = dict(bad_rows[3])
+        bad_rows[3]["metrics"] = dict(bad_rows[3]["metrics"])
+        bad_rows[3]["metrics"]["interventions"] = -1
+        with self.assertRaises(ValidationFailed) as ctx:
+            self.service.import_observations("operator", "batch-a", "key-bad", bad_rows)
+        self.assertIn("observation.metrics.interventions", str(ctx.exception))
+        # 整批回滚：观测、幂等键、导入事件都不得落库。
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM observations").fetchone()[0], 0
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM idempotency_keys WHERE scope=? AND key=?",
+                ("observations:batch-a", "key-bad"),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM audit_events WHERE event_type='observations.imported'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_corrected_batch_reuses_idempotency_key_after_rejection(self) -> None:
+        bad_rows = [dict(item) for item in self.rows]
+        bad_rows[0] = dict(bad_rows[0])
+        bad_rows[0]["metrics"] = dict(bad_rows[0]["metrics"])
+        bad_rows[0]["metrics"]["interventions"] = -1
+        with self.assertRaises(ValidationFailed):
+            self.service.import_observations("operator", "batch-a", "key-fix", bad_rows)
+        # 被拒批次未占用幂等键，修正后用同一键按既有规则成功导入并重放一致。
+        first = self.service.import_observations("operator", "batch-a", "key-fix", self.rows)
+        self.assertEqual(first["inserted"], 6)
+        second = self.service.import_observations("operator", "batch-a", "key-fix", self.rows)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM observations").fetchone()[0], 6
+        )
 
     def test_role_separation(self) -> None:
         with self.assertRaises(Forbidden):
